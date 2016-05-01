@@ -78,12 +78,13 @@
 
 #include <rte_ip_frag.h>
 
+#define FRAG
+#define IPV4_MTU_DEFAULT		ETHER_MTU
+
 #define MAX_PKT_BURST 32
 
-
 #define RTE_LOGTYPE_IP_RSMBL RTE_LOGTYPE_USER1
-
-#define MAX_JUMBO_PKT_LEN  9600
+#define RTE_LOGTYPE_IP_FRAG RTE_LOGTYPE_USER2
 
 #define	BUF_SIZE	RTE_MBUF_DEFAULT_DATAROOM
 #define MBUF_SIZE	(BUF_SIZE + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
@@ -100,44 +101,21 @@
 /* TTL numbers are in ms. */
 #define	MAX_FLOW_TTL	(3600 * MS_PER_S)
 #define	MIN_FLOW_TTL	1
-#define	DEF_FLOW_TTL	MS_PER_S
+#define	DEF_FLOW_TTL	MS_PER_S			/* timeout in 1 sec */
 
 #define MAX_FRAG_NUM RTE_LIBRTE_IP_FRAG_MAX_FRAG
 
 /* Should be power of two. */
 #define	IP_FRAG_TBL_BUCKET_ENTRIES	16
 
-static uint32_t max_flow_num = DEF_FLOW_NUM;
-static uint32_t max_flow_ttl = DEF_FLOW_TTL;
-static uint32_t tx_pps = 0;
-static uint64_t enq_fail = 0;
-
-#define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
-
 /* Configure how many packets ahead to prefetch, when reading packets */
 #define PREFETCH_OFFSET	3
 
-
-#ifndef IPv4_BYTES
-#define IPv4_BYTES_FMT "%" PRIu8 ".%" PRIu8 ".%" PRIu8 ".%" PRIu8
-#define IPv4_BYTES(addr) \
-		(uint8_t) (((addr) >> 24) & 0xFF),\
-		(uint8_t) (((addr) >> 16) & 0xFF),\
-		(uint8_t) (((addr) >> 8) & 0xFF),\
-		(uint8_t) ((addr) & 0xFF)
-#endif
-
-#ifndef IPv6_BYTES
-#define IPv6_BYTES_FMT "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"\
-                       "%02x%02x:%02x%02x:%02x%02x:%02x%02x"
-#define IPv6_BYTES(addr) \
-	addr[0],  addr[1], addr[2],  addr[3], \
-	addr[4],  addr[5], addr[6],  addr[7], \
-	addr[8],  addr[9], addr[10], addr[11],\
-	addr[12], addr[13],addr[14], addr[15]
-#endif
-
-#define IPV6_ADDR_LEN 16
+static uint32_t max_flow_num = DEF_FLOW_NUM;
+static uint32_t max_flow_ttl = DEF_FLOW_TTL;
+static uint32_t tx_pps = 1;
+static uint32_t display_pps = 1;
+static uint64_t enq_fail = 0;
 
 struct mbuf_table {
 	uint32_t len;
@@ -146,10 +124,18 @@ struct mbuf_table {
 	struct rte_mbuf *m_table[0];
 };
 
+/* reassembly */
 struct rte_ip_frag_tbl *frag_tbl;
 struct rte_mempool *pool;
 struct rte_ring *ring;
 #define RING_NAME		"RING"
+
+/* fragmentation */
+struct rte_mempool *direct_pool;
+struct rte_mempool *indirect_pool;
+#define DIR_MP_NAME		"DIR_MP"
+#define INDIR_MP_NAME	"INDIR_MP"
+#define NB_MBUF			8192
 
 struct tx_lcore_stat {
 	uint64_t call;
@@ -165,7 +151,6 @@ struct tx_lcore_stat {
 struct lcore_queue_conf {
 	struct rte_ip_frag_death_row death_row;
 	struct mbuf_table *tx_mbufs[RTE_MAX_ETHPORTS];
-	struct tx_lcore_stat tx_stat;
 } __rte_cache_aligned;
 static struct lcore_queue_conf lcore_queue_conf[RTE_MAX_LCORE];
 
@@ -251,10 +236,16 @@ static inline struct rte_mbuf *build_pkt(void)
 {
 	static uint64_t tx_count = 0;
 	static uint16_t packet_id = 0;
-	const uint32_t frag_size = 1480;	/* should be multile of 8 */
+	uint32_t frag_size;
+   
 	struct rte_mbuf *m;
 	struct ipv4_hdr *ip;
    
+#ifdef FRAG
+	frag_size = IPV4_MTU_DEFAULT + 10;
+#else
+	frag_size = 1480;	/* should be multile of 8 */
+#endif
 	m = rte_pktmbuf_alloc(pool);
 	if (m == NULL)
 		return NULL;
@@ -263,6 +254,12 @@ static inline struct rte_mbuf *build_pkt(void)
 	ip->dst_addr = 0x01020304;
 	ip->src_addr = 0x02030405;
 
+#ifdef FRAG
+	packet_id = rte_rand() & 0xFFFF;
+	ip->fragment_offset = 0;
+	ip->total_length = rte_cpu_to_be_16(frag_size);
+	m->pkt_len = m->data_len = frag_size;
+#else
 	if ((tx_count % 2) == 0) {
 		packet_id = rte_rand() & 0xFFFF;
 		ip->fragment_offset = rte_cpu_to_be_16(IPV4_HDR_MF_FLAG);
@@ -273,10 +270,11 @@ static inline struct rte_mbuf *build_pkt(void)
 		ip->total_length = rte_cpu_to_be_16(20 + 10);
 		m->pkt_len = m->data_len = 20 + 10;
 	}
+#endif
 
 	ip->packet_id = rte_cpu_to_be_16(packet_id);
 
-	RTE_LOG(DEBUG, IP_RSMBL, "producer, id(N) %u\n", ip->packet_id);
+	RTE_LOG(DEBUG, IP_RSMBL, "%10ju producer, id(N) %u\n", tx_count, ip->packet_id);
 
 	m->l2_len = 0;
 	m->l3_len = sizeof(struct ipv4_hdr);
@@ -316,8 +314,9 @@ producer(void)
 					rte_pktmbuf_free(m);
 					enq_fail += 1;
 				}
+			} else {
+				RTE_LOG(ERR, IP_RSMBL, "mbuf alloc fail\n");
 			}
-
 
 #if 0
 			if (count > 100) while(1) rte_delay_us(10000);
@@ -334,17 +333,23 @@ consumer(void)
 	unsigned lcore_id;
 	uint64_t diff_tsc;
 	uint64_t cur_tsc;
+	uint64_t prev_disp_tsc;
 	uint64_t prev_tsc;
 
-	int i, nb_rx;
+	int i;
 	struct lcore_queue_conf *qconf;
-	const uint64_t interval_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * REPORT_INTERVAL_US;
+	const uint64_t interval_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * (1000000/tx_pps);
+	const uint64_t display_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S *  (1000000) * display_pps;
 	uint64_t rx_count = 0;
 	uint64_t reasm_count = 0;
 	uint64_t last_count = 0;
 	uint64_t last_reasm = 0;
+	/*
+	int nb_rx;
+	*/
 
 	prev_tsc = 0;
+	prev_disp_tsc = 0;
 
 	lcore_id = rte_lcore_id();
 
@@ -359,14 +364,14 @@ consumer(void)
 
 		cur_tsc = rte_rdtsc();
 
-		diff_tsc = cur_tsc - prev_tsc;
+		diff_tsc = cur_tsc - prev_disp_tsc;
 
-		if (diff_tsc > interval_tsc)
+		if (diff_tsc > display_tsc)
 		{
 			uint64_t incr_rx;
 			uint64_t incr_reasm;
 
-			prev_tsc = cur_tsc;
+			prev_disp_tsc = cur_tsc;
 			incr_rx = rx_count - last_count;
 			incr_reasm = reasm_count - last_reasm;
 
@@ -381,19 +386,52 @@ consumer(void)
 			last_reasm = reasm_count;
 		}
 
+#if 0
 		/* FIXME */
 		nb_rx = 0;
 		nb_rx = rte_ring_dequeue(ring, (void **)&m);
 		if (nb_rx < 0) {
 			continue;
 		}
+#else
+		diff_tsc = cur_tsc - prev_tsc;
+		if (diff_tsc > interval_tsc) {
+			prev_tsc = cur_tsc;
+			m = build_pkt();
+			if (unlikely(m == NULL)) {
+				rte_panic("mbuf alloc fail\n");
+			}
+		} else {
+			continue;
+		}
+#endif
 
 		ip = rte_pktmbuf_mtod(m, struct ipv4_hdr *);
 
-		RTE_LOG(DEBUG, IP_RSMBL, "[%d] consumer, id(N) %u, offset %u\n", 
-					lcore_id, ip->packet_id, ip->fragment_offset);
+		RTE_LOG(DEBUG, IP_RSMBL, "[%d] consumer, %p id(N) %u, offset %u\n", 
+				lcore_id, m, ip->packet_id, ip->fragment_offset);
+#ifdef FRAG
+		{
+			struct rte_mbuf *m_table[2];
+			int ret;
+
+			ret = rte_ipv4_fragment_packet(m, &m_table[0], 1, IPV4_MTU_DEFAULT, direct_pool, indirect_pool);
+			rte_pktmbuf_free(m);
+
+			if (ret < 0) {
+				RTE_LOG(DEBUG, IP_RSMBL, "[%d] fail to fragment\n", lcore_id);
+			}
+
+			for (i = 0;i < 2; i++) {
+				RTE_LOG(DEBUG, IP_RSMBL, "%u %p\n", i, m_table[i]);
+				m = reassemble(m_table[i], 0, 0, qconf, cur_tsc);
+				rx_count++;
+			}
+		}
+#else
 		m = reassemble(m, 0, i, qconf, cur_tsc);
 		rx_count++;
+#endif
 
 		if (m == NULL) {
 			if (unlikely((enq_fail == 0) && (rx_count % 2) == 0)) {
@@ -405,6 +443,7 @@ consumer(void)
 		}
 
 #if 0
+
 		/* Prefetch first packets */
 		for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
 			rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j], void *));
@@ -433,11 +472,11 @@ main_loop(__attribute__((unused)) void *dummy)
 	lcore_id = rte_lcore_id();
 
 	if (lcore_id == 0) {
-		printf("[%u] Run producer\n", lcore_id);
-		producer();
-	} else {
 		printf("[%u] Run consumer\n", lcore_id);
 		consumer();
+	} else {
+		printf("[%u] Run producer\n", lcore_id);
+		producer();
 	}
 }
 
@@ -517,7 +556,8 @@ parse_args(int argc, char **argv)
 		{"max-pkt-len", 1, 0, 0},
 		{"maxflows", 1, 0, 0},
 		{"flowttl", 1, 0, 0},
-		{"tx_kpps", 1, 0, 0},
+		{"tx_pps", 1, 0, 0},
+		{"display_pps", 1, 0, 0},
 		{NULL, 0, 0, 0}
 	};
 
@@ -557,7 +597,7 @@ parse_args(int argc, char **argv)
 				}
 			}
 
-			if (!strncmp(lgopts[option_index].name, "tx_kpps", 6)) {
+			if (!strncmp(lgopts[option_index].name, "tx_pps", 6)) {
 				tx_pps = (uint32_t)strtol(optarg, NULL, 0);
 
 				if (tx_pps == 0) {
@@ -565,7 +605,18 @@ parse_args(int argc, char **argv)
 					print_usage(prgname);
 					return -1;
 				}
-				tx_pps *= 1000;
+				//tx_pps *= 1000;
+			}
+
+			if (!strncmp(lgopts[option_index].name, "display_pps", 6)) {
+				display_pps = (uint32_t)strtol(optarg, NULL, 0);
+
+				if (display_pps == 0) {
+					printf("invalid pps\n");
+					print_usage(prgname);
+					return -1;
+				}
+				//tx_pps *= 1000;
 			}
 
 			break;
@@ -636,6 +687,31 @@ setup_queue_tbl(uint32_t lcore, uint32_t queue)
 	return 0;
 }
 
+static int
+setup_frag(void)
+{
+	int socket = 0;
+
+	direct_pool = rte_pktmbuf_pool_create(DIR_MP_NAME, NB_MBUF, 32,
+			0, RTE_MBUF_DEFAULT_BUF_SIZE, socket);
+	if (direct_pool == NULL) {
+		RTE_LOG(ERR, IP_FRAG, "Cannot create direct mempool\n");
+		return -1;
+	}
+	RTE_LOG(ERR, IP_FRAG, "Direct_pool %p\n", direct_pool); 
+
+	indirect_pool = rte_pktmbuf_pool_create(INDIR_MP_NAME, NB_MBUF, 32, 0, 0,
+			socket);
+	if (indirect_pool == NULL) {
+		RTE_LOG(ERR, IP_FRAG, "Cannot create indirect mempool\n");
+		return -1;
+	}
+	RTE_LOG(ERR, IP_FRAG, "Indirect_pool %p\n", indirect_pool); 
+
+	return 0;
+}
+
+
 static int 
 setup_ring(void)
 {
@@ -668,7 +744,7 @@ main(int argc, char **argv)
 	argc -= ret;
 	argv += ret;
 
-	rte_set_log_level(RTE_LOG_INFO);
+//	rte_set_log_level(RTE_LOG_INFO);
 	/* parse application arguments (after the EAL ones) */
 	ret = parse_args(argc, argv);
 	if (ret < 0)
@@ -678,7 +754,11 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "setup_ring failed\n");
 
 	if (setup_queue_tbl(0, 0) < 0)
-		rte_exit(EXIT_FAILURE, "setup_queue_tbl failed\n");
+		rte_exit(EXIT_FAILURE, "fail to init reassembly\n");
+
+	if (setup_frag() < 0)
+		rte_exit(EXIT_FAILURE, "fail to init fragmentation\n");
+
 
 	signal(SIGUSR1, signal_handler);
 	signal(SIGTERM, signal_handler);
