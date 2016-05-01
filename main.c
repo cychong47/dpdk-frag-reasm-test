@@ -247,6 +247,44 @@ reassemble(struct rte_mbuf *m, uint8_t portid, uint32_t queue,
 	}
 }
 
+static inline struct rte_mbuf *build_pkt(void)
+{
+	static uint64_t tx_count = 0;
+	static uint16_t packet_id = 0;
+	const uint32_t frag_size = 1480;	/* should be multile of 8 */
+	struct rte_mbuf *m;
+	struct ipv4_hdr *ip;
+   
+	m = rte_pktmbuf_alloc(pool);
+	if (m == NULL)
+		return NULL;
+
+	ip = rte_pktmbuf_mtod(m, struct ipv4_hdr *);
+	ip->dst_addr = 0x01020304;
+	ip->src_addr = 0x02030405;
+
+	if ((tx_count % 2) == 0) {
+		packet_id = rte_rand() & 0xFFFF;
+		ip->fragment_offset = rte_cpu_to_be_16(IPV4_HDR_MF_FLAG);
+		ip->total_length = rte_cpu_to_be_16(20 + frag_size);
+		m->pkt_len = m->data_len = 20 + frag_size;
+	} else {
+		ip->fragment_offset = rte_cpu_to_be_16(frag_size/8);
+		ip->total_length = rte_cpu_to_be_16(20 + 10);
+		m->pkt_len = m->data_len = 20 + 10;
+	}
+
+	ip->packet_id = rte_cpu_to_be_16(packet_id);
+
+	RTE_LOG(DEBUG, IP_RSMBL, "producer, id(N) %u\n", ip->packet_id);
+
+	m->l2_len = 0;
+	m->l3_len = sizeof(struct ipv4_hdr);
+	tx_count++;
+
+	return m;
+}
+
 #define INTERVAL_US	10		/* 10us per packet -> 100,000 pps*/
 static int
 producer(void)
@@ -255,16 +293,13 @@ producer(void)
 	uint64_t cur_tsc;
 	uint64_t prev_tsc;
 	uint64_t interval_tsc;
+	struct rte_mbuf *m = NULL;
    
-	unsigned lcore_id = rte_lcore_id();
-	uint64_t tx_count = 0;
-	uint16_t packet_id = 0;
-	const uint32_t frag_size = 1480;	/* should be multile of 8 */
-	
 	interval_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * (1000000/tx_pps);
 	prev_tsc = 0;
 
 	while (1) {
+		m = NULL;
 
 		cur_tsc = rte_rdtsc();
 		diff_tsc = cur_tsc - prev_tsc;
@@ -273,48 +308,19 @@ producer(void)
 		{
 			prev_tsc = cur_tsc;
 
-			struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
-			if (m == NULL)
-				continue;
+			m = build_pkt();
 
-			struct ipv4_hdr *ip;
-
-			ip = rte_pktmbuf_mtod(m, struct ipv4_hdr *);
-			ip->dst_addr = 0x01020304;
-			ip->src_addr = 0x02030405;
-
-			if ((tx_count % 2) == 0) {
-				packet_id = rte_rand() & 0xFFFF;
-				ip->fragment_offset = rte_cpu_to_be_16(IPV4_HDR_MF_FLAG);
-				ip->total_length = rte_cpu_to_be_16(20 + frag_size);
-				m->pkt_len = m->data_len = 20 + frag_size;
-			} else {
-				ip->fragment_offset = rte_cpu_to_be_16(frag_size/8);
-				ip->total_length = rte_cpu_to_be_16(20 + 10);
-				m->pkt_len = m->data_len = 20 + 10;
+			if (unlikely(m != NULL)) {
+				if (rte_ring_enqueue(ring, m) < 0) {
+					//	RTE_LOG(ERR, IP_RSMBL, "fail to enqueue\n");
+					rte_pktmbuf_free(m);
+					enq_fail += 1;
+				}
 			}
 
-			ip->packet_id = rte_cpu_to_be_16(packet_id);
-
-			RTE_LOG(DEBUG, IP_RSMBL, "[%d] producer, id(N) %u\n", 
-					lcore_id, ip->packet_id);
-
-			m->l2_len = 0;
-			m->l3_len = sizeof(struct ipv4_hdr);
-
-			if (rte_ring_enqueue(ring, m) < 0) {
-//				RTE_LOG(ERR, IP_RSMBL, "[%d] fail to enqueue\n", lcore_id);
-				rte_pktmbuf_free(m);
-				enq_fail += 1;
-			}
-
-			tx_count++;
 
 #if 0
-			if (count > 100)
-			{
-				while(1) rte_delay_us(10000);
-			}
+			if (count > 100) while(1) rte_delay_us(10000);
 #endif
 		}
 	}
