@@ -358,7 +358,7 @@ consumer(void)
 
 	RTE_LOG(INFO, IP_RSMBL, "entering main loop on lcore %u\n", lcore_id);
 
-	while (1) {
+	while (rx_count < 10000) {
 		struct rte_mbuf *m = NULL;
 		struct ipv4_hdr *ip;
 
@@ -380,7 +380,7 @@ consumer(void)
 					reasm_count, incr_reasm,
 					incr_rx * 1500*8/1000/1000,
 					enq_fail);
-			rte_ip_frag_table_statistics_dump(stdout, frag_tbl);
+//			rte_ip_frag_table_statistics_dump(stdout, frag_tbl);
 
 			last_count = rx_count;
 			last_reasm = reasm_count;
@@ -415,11 +415,11 @@ consumer(void)
 			struct rte_mbuf *m_table[2];
 			int ret;
 
-			ret = rte_ipv4_fragment_packet(m, &m_table[0], 1, IPV4_MTU_DEFAULT, direct_pool, indirect_pool);
+			ret = rte_ipv4_fragment_packet(m, (struct rte_mbuf **)&m_table, 2, IPV4_MTU_DEFAULT, direct_pool, indirect_pool);
 			rte_pktmbuf_free(m);
 
 			if (ret < 0) {
-				RTE_LOG(DEBUG, IP_RSMBL, "[%d] fail to fragment\n", lcore_id);
+				RTE_LOG(DEBUG, IP_RSMBL, "[%d] fail to fragment (%d)`\n", lcore_id, ret);
 			}
 
 			for (i = 0;i < 2; i++) {
@@ -744,7 +744,7 @@ main(int argc, char **argv)
 	argc -= ret;
 	argv += ret;
 
-//	rte_set_log_level(RTE_LOG_INFO);
+	rte_set_log_level(RTE_LOG_INFO);
 	/* parse application arguments (after the EAL ones) */
 	ret = parse_args(argc, argv);
 	if (ret < 0)
