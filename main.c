@@ -89,7 +89,7 @@
 #define	BUF_SIZE	RTE_MBUF_DEFAULT_DATAROOM
 #define MBUF_SIZE	(BUF_SIZE + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
 
-#define NB_MBUF 	8192
+#define NB_MBUF 	40100
 
 /* allow max jumbo frame 9.5 KB */
 #define JUMBO_FRAME_MAX_SIZE	0x2600
@@ -158,7 +158,6 @@ struct rte_mempool *direct_pool;
 struct rte_mempool *indirect_pool;
 #define DIR_MP_NAME		"DIR_MP"
 #define INDIR_MP_NAME	"INDIR_MP"
-#define NB_MBUF			8192
 
 struct lcore_queue_conf {
 	struct rte_ip_frag_tbl *frag_tbl;
@@ -332,6 +331,11 @@ producer(void)
 	}
 }
 
+/**
+ * print LRU entries
+ * 
+ * @param tbl
+ */
 static void rte_print_lru(struct rte_ip_frag_tbl *tbl)
 {
 	struct ip_frag_pkt *fp;
@@ -340,6 +344,7 @@ static void rte_print_lru(struct rte_ip_frag_tbl *tbl)
 	uint32_t expired = 0;
 	struct ip_pkt_list *lru;
 	uint32_t i;
+	uint32_t count = 0;
 
 	max_cycles = tbl->max_cycles;
 	cur_tsc = rte_rdtsc();
@@ -356,8 +361,8 @@ static void rte_print_lru(struct rte_ip_frag_tbl *tbl)
 		}
 
 		/* Note. Assume that the first fragment is received */
-		RTE_LOG(INFO, IP_RSMBL, "lru %p mbuf[1] %p id(N) %5u last_idx %u Elapsed:%16ju(%s)\n", 
-				fp, fp->frags[1].mb, fp->key.id, fp->last_idx, 
+		RTE_LOG(INFO, IP_RSMBL, "[%4u] lru %p mbuf[1] %p id(N) %5u last_idx %u Elapsed:%16ju(%s)\n", 
+				count, fp, fp->frags[1].mb, fp->key.id, fp->last_idx, 
 				cur_tsc - fp->start, expired == 1 ? "expired" : "");
 		for (i = 0 ; i < IP_MAX_FRAG_NUM; i++) {
 			RTE_LOG(INFO, IP_RSMBL, "\t[%u] %p\n", i, fp->frags[i].mb);
@@ -365,6 +370,8 @@ static void rte_print_lru(struct rte_ip_frag_tbl *tbl)
 
 		if (app_config.dump)
 			rte_pktmbuf_dump(stdout, fp->frags[1].mb, 20);
+
+		count++;
 	}
 	RTE_LOG(INFO, IP_RSMBL, "----------------------------------------\n");
 }
@@ -372,11 +379,11 @@ static void rte_print_lru(struct rte_ip_frag_tbl *tbl)
 
 inline static void print_mempool_status(void)
 {
-	RTE_LOG(INFO, IP_RSMBL, ">>>>> mbuf count %u %u %u\n", 
+	RTE_LOG(NOTICE, IP_RSMBL, ">>>>> mbuf count %u %u %u\n", 
 			rte_mempool_count(pool),
 			rte_mempool_count(direct_pool),
 			rte_mempool_count(indirect_pool));
-	RTE_LOG(INFO, IP_RSMBL, ">>>>> free mbuf count %u %u %u\n", 
+	RTE_LOG(NOTICE, IP_RSMBL, ">>>>> free mbuf count %u %u %u\n", 
 			rte_mempool_free_count(pool),
 			rte_mempool_free_count(direct_pool),
 			rte_mempool_free_count(indirect_pool));
@@ -456,7 +463,8 @@ consumer(void)
 				RTE_LOG(INFO, IP_RSMBL, "%d fragments\n", ret);
 
 				if (ret < 0) {
-					RTE_LOG(DEBUG, IP_RSMBL, "fail to fragment (%d)\n", ret);
+					RTE_LOG(ERR, IP_RSMBL, "fail to fragment (%d)\n", ret);
+					print_mempool_status();
 					continue;
 				}
 
@@ -490,7 +498,7 @@ consumer(void)
 #endif
 
 			if (m == NULL) {
-				RTE_LOG(ERR, IP_RSMBL, "Failed to reassemble\n");
+				RTE_LOG(DEBUG, IP_RSMBL, "fail to reassemble\n");
 			} else {
 				reasm_count++;
 				RTE_LOG(INFO, IP_RSMBL, "Free reassembled mbuf %p\n", m);
