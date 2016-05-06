@@ -111,11 +111,23 @@
 /* Configure how many packets ahead to prefetch, when reading packets */
 #define PREFETCH_OFFSET	3
 
-static uint32_t max_flow_num = DEF_FLOW_NUM;
-static uint32_t max_flow_ttl = DEF_FLOW_TTL;
-static uint32_t tx_pps = 1;
-static uint32_t display_pps = 1;
-static uint64_t enq_fail = 0;
+static struct app_config_t {
+	uint32_t max_flow_num;
+	uint32_t max_flow_ttl;
+	uint32_t tx_pps;
+	uint32_t display_pps;
+	uint32_t log_level;
+	uint64_t count;
+	uint64_t enq_fail;
+} app_config = {
+	.max_flow_num = DEF_FLOW_NUM,
+	.max_flow_ttl = DEF_FLOW_TTL,
+	.tx_pps = 1,
+	.display_pps = 1,
+	.count = 1,
+	.enq_fail = 0,
+	.log_level = RTE_LOG_INFO,
+};
 
 struct mbuf_table {
 	uint32_t len;
@@ -274,7 +286,7 @@ static inline struct rte_mbuf *build_pkt(void)
 
 	ip->packet_id = rte_cpu_to_be_16(packet_id);
 
-	RTE_LOG(DEBUG, IP_RSMBL, "%10ju producer, id(N) %u\n", tx_count, ip->packet_id);
+	RTE_LOG(DEBUG, IP_RSMBL, "%10ju producer, id(N) %5u\n", tx_count, ip->packet_id);
 
 	m->l2_len = 0;
 	m->l3_len = sizeof(struct ipv4_hdr);
@@ -293,7 +305,7 @@ producer(void)
 	uint64_t interval_tsc;
 	struct rte_mbuf *m = NULL;
    
-	interval_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * (1000000/tx_pps);
+	interval_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * (1000000/app_config.tx_pps);
 	prev_tsc = 0;
 
 	while (1) {
@@ -312,15 +324,11 @@ producer(void)
 				if (rte_ring_enqueue(ring, m) < 0) {
 					//	RTE_LOG(ERR, IP_RSMBL, "fail to enqueue\n");
 					rte_pktmbuf_free(m);
-					enq_fail += 1;
+					app_config.enq_fail += 1;
 				}
 			} else {
 				RTE_LOG(ERR, IP_RSMBL, "mbuf alloc fail\n");
 			}
-
-#if 0
-			if (count > 100) while(1) rte_delay_us(10000);
-#endif
 		}
 	}
 }
@@ -333,14 +341,16 @@ consumer(void)
 	unsigned lcore_id;
 	uint64_t diff_tsc;
 	uint64_t cur_tsc;
-	uint64_t prev_disp_tsc;
+	uint64_t prev_print_tsc;
 	uint64_t prev_tsc;
 
 	int i;
 	struct lcore_queue_conf *qconf;
-	const uint64_t interval_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * (1000000/tx_pps);
-	const uint64_t display_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S *  (1000000) * display_pps;
-	uint64_t rx_count = 0;
+	const uint64_t interval_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S
+		* (1000000/app_config.tx_pps);
+	const uint64_t display_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S
+		* (1000000) * app_config.display_pps;
+	uint64_t count = 0;
 	uint64_t reasm_count = 0;
 	uint64_t last_count = 0;
 	uint64_t last_reasm = 0;
@@ -349,42 +359,20 @@ consumer(void)
 	*/
 
 	prev_tsc = 0;
-	prev_disp_tsc = 0;
+	prev_print_tsc = 0;
 
 	lcore_id = rte_lcore_id();
 
-	printf("core_id %d\n", lcore_id);
 	qconf = &lcore_queue_conf[lcore_id];
 
 	RTE_LOG(INFO, IP_RSMBL, "entering main loop on lcore %u\n", lcore_id);
+	RTE_LOG(INFO, IP_RSMBL, "process %ju packets\n", app_config.count);
 
-	while (rx_count < 10000) {
+	while (count < app_config.count) {
 		struct rte_mbuf *m = NULL;
 		struct ipv4_hdr *ip;
 
 		cur_tsc = rte_rdtsc();
-
-		diff_tsc = cur_tsc - prev_disp_tsc;
-
-		if (diff_tsc > display_tsc)
-		{
-			uint64_t incr_rx;
-			uint64_t incr_reasm;
-
-			prev_disp_tsc = cur_tsc;
-			incr_rx = rx_count - last_count;
-			incr_reasm = reasm_count - last_reasm;
-
-			RTE_LOG(INFO, IP_RSMBL, "rx %10ju(+%7ju) reasm %10ju(+%7ju), %ju Mbps, enq_fail %ju\n",
-					rx_count, incr_rx, 
-					reasm_count, incr_reasm,
-					incr_rx * 1500*8/1000/1000,
-					enq_fail);
-//			rte_ip_frag_table_statistics_dump(stdout, frag_tbl);
-
-			last_count = rx_count;
-			last_reasm = reasm_count;
-		}
 
 #if 0
 		/* FIXME */
@@ -395,70 +383,77 @@ consumer(void)
 		}
 #else
 		diff_tsc = cur_tsc - prev_tsc;
+
 		if (diff_tsc > interval_tsc) {
 			prev_tsc = cur_tsc;
 			m = build_pkt();
 			if (unlikely(m == NULL)) {
 				rte_panic("mbuf alloc fail\n");
 			}
-		} else {
-			continue;
-		}
 #endif
 
-		ip = rte_pktmbuf_mtod(m, struct ipv4_hdr *);
+			ip = rte_pktmbuf_mtod(m, struct ipv4_hdr *);
 
-		RTE_LOG(DEBUG, IP_RSMBL, "[%d] consumer, %p id(N) %u, offset %u\n", 
-				lcore_id, m, ip->packet_id, ip->fragment_offset);
+			RTE_LOG(INFO, IP_RSMBL, "%p id(N) %5u, offset %u\n", 
+					m, ip->packet_id, ip->fragment_offset);
 #ifdef FRAG
-		{
-			struct rte_mbuf *m_table[2];
-			int ret;
+			{
+				struct rte_mbuf *m_table[2];
+				int ret;
 
-			ret = rte_ipv4_fragment_packet(m, (struct rte_mbuf **)&m_table, 2, IPV4_MTU_DEFAULT, direct_pool, indirect_pool);
-			rte_pktmbuf_free(m);
+				ret = rte_ipv4_fragment_packet(m, (struct rte_mbuf **)&m_table, 
+						2, IPV4_MTU_DEFAULT, direct_pool, indirect_pool);
+				rte_pktmbuf_free(m);
 
-			if (ret < 0) {
-				RTE_LOG(DEBUG, IP_RSMBL, "[%d] fail to fragment (%d)`\n", lcore_id, ret);
+				if (ret < 0) {
+					RTE_LOG(DEBUG, IP_RSMBL, "fail to fragment (%d)`\n", ret);
+					continue;
+				}
+
+				for (i = 0;i < 2; i++) {
+					RTE_LOG(DEBUG, IP_RSMBL, "%u %p\n", i, m_table[i]);
+					m = reassemble(m_table[i], 0, 0, qconf, cur_tsc);
+				}
+				count++;
 			}
-
-			for (i = 0;i < 2; i++) {
-				RTE_LOG(DEBUG, IP_RSMBL, "%u %p\n", i, m_table[i]);
-				m = reassemble(m_table[i], 0, 0, qconf, cur_tsc);
-				rx_count++;
-			}
-		}
 #else
-		m = reassemble(m, 0, i, qconf, cur_tsc);
-		rx_count++;
+			m = reassemble(m, 0, i, qconf, cur_tsc);
+			count++;
 #endif
 
-		if (m == NULL) {
-			if (unlikely((enq_fail == 0) && (rx_count % 2) == 0)) {
-				RTE_LOG(ERR, IP_RSMBL, "[%d] Failed to reassemble\n", lcore_id);
+			if (m == NULL) {
+				if (unlikely((app_config.enq_fail == 0) && (count % 2) == 0)) {
+					RTE_LOG(ERR, IP_RSMBL, "Failed to reassemble\n");
+				}
+			} else {
+				reasm_count++;
+				rte_pktmbuf_free(m);
 			}
-		} else {
-			reasm_count++;
-			rte_pktmbuf_free(m);
 		}
 
-#if 0
+		/* print stats */
+		diff_tsc = cur_tsc - prev_print_tsc;
 
-		/* Prefetch first packets */
-		for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
-			rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j], void *));
-		}
+		if (diff_tsc > display_tsc)
+		{
+			uint64_t incr_rx;
+			uint64_t incr_reasm;
 
-		/* Prefetch and forward already prefetched packets */
-		for (j = 0; j < (nb_rx - PREFETCH_OFFSET); j++) {
-			rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j + PREFETCH_OFFSET], void *));
-		}
+			prev_print_tsc = cur_tsc;
+			incr_rx = count - last_count;
+			incr_reasm = reasm_count - last_reasm;
 
-		/* Forward remaining prefetched packets */
-		for (; j < nb_rx; j++) {
-			reassemble(pkts_burst[j], 0, i, qconf, cur_tsc);
+			RTE_LOG(INFO, IP_RSMBL, "rx %10ju(+%7ju) reasm %10ju(+%7ju), %ju Mbps, enq_fail %ju\n",
+					count, incr_rx, 
+					reasm_count, incr_reasm,
+					incr_rx * 1500*8/1000/1000,
+					app_config.enq_fail);
+
+			rte_ip_frag_table_statistics_dump(stdout, frag_tbl);
+
+			last_count = count;
+			last_reasm = reasm_count;
 		}
-#endif
 
 		rte_ip_frag_free_death_row(&qconf->death_row, PREFETCH_OFFSET);
 	}
@@ -492,7 +487,10 @@ print_usage(const char *prgname)
 		"  --maxflows=<flows>: optional, maximum number of flows "
 		"supported\n"
 		"  --flowttl=<ttl>[(s|ms)]: optional, maximum TTL for each "
-		"flow\n",
+		"flow\n"
+		"  --tx_pps=<pps>:Tx PPS\n"
+		"  --count=<pps>:number of packet to test "
+		"  --log=<log_level>:1:Emergency, 4:Error, 7:Info, 8:Debug",
 		prgname);
 }
 
@@ -557,7 +555,9 @@ parse_args(int argc, char **argv)
 		{"maxflows", 1, 0, 0},
 		{"flowttl", 1, 0, 0},
 		{"tx_pps", 1, 0, 0},
+		{"count", 1, 0, 0},
 		{"display_pps", 1, 0, 0},
+		{"log", 1, 0, 0},
 		{NULL, 0, 0, 0}
 	};
 
@@ -574,7 +574,7 @@ parse_args(int argc, char **argv)
 					"maxflows", 8)) {
 				if ((ret = parse_flow_num(optarg, MIN_FLOW_NUM,
 						MAX_FLOW_NUM,
-						&max_flow_num)) != 0) {
+						&app_config.max_flow_num)) != 0) {
 					printf("invalid value: \"%s\" for "
 						"parameter %s\n",
 						optarg,
@@ -587,7 +587,7 @@ parse_args(int argc, char **argv)
 			if (!strncmp(lgopts[option_index].name, "flowttl", 7)) {
 				if ((ret = parse_flow_ttl(optarg, MIN_FLOW_TTL,
 						MAX_FLOW_TTL,
-						&max_flow_ttl)) != 0) {
+						&app_config.max_flow_ttl)) != 0) {
 					printf("invalid value: \"%s\" for "
 							"parameter %s\n",
 							optarg,
@@ -598,25 +598,44 @@ parse_args(int argc, char **argv)
 			}
 
 			if (!strncmp(lgopts[option_index].name, "tx_pps", 6)) {
-				tx_pps = (uint32_t)strtol(optarg, NULL, 0);
+				app_config.tx_pps = (uint32_t)strtol(optarg, NULL, 0);
 
-				if (tx_pps == 0) {
+				if (app_config.tx_pps == 0) {
 					printf("invalid pps\n");
 					print_usage(prgname);
 					return -1;
 				}
-				//tx_pps *= 1000;
 			}
 
 			if (!strncmp(lgopts[option_index].name, "display_pps", 6)) {
-				display_pps = (uint32_t)strtol(optarg, NULL, 0);
+				app_config.display_pps = (uint32_t)strtol(optarg, NULL, 0);
 
-				if (display_pps == 0) {
+				if (app_config.display_pps == 0) {
 					printf("invalid pps\n");
 					print_usage(prgname);
 					return -1;
 				}
-				//tx_pps *= 1000;
+			}
+
+			if (!strncmp(lgopts[option_index].name, "count", 5)) {
+				app_config.count = (uint32_t)strtol(optarg, NULL, 0);
+
+				if (app_config.count == 0) {
+					printf("invalid count\n");
+					print_usage(prgname);
+					return -1;
+				}
+			}
+
+			if (!strncmp(lgopts[option_index].name, "log", 3)) {
+				app_config.log_level = (uint32_t)strtol(optarg, NULL, 0);
+
+				if ((app_config.log_level < RTE_LOG_EMERG) || 
+						app_config.log_level > RTE_LOG_DEBUG) {
+					printf("invalid log_level\n");
+					print_usage(prgname);
+					return -1;
+				}
 			}
 
 			break;
@@ -650,14 +669,14 @@ setup_queue_tbl(uint32_t lcore, uint32_t queue)
 		socket = 0;
 
 	frag_cycles = (rte_get_tsc_hz() + MS_PER_S - 1) / MS_PER_S *
-		max_flow_ttl;
+		app_config.max_flow_ttl;
 
-	if ((frag_tbl = rte_ip_frag_table_create(max_flow_num,
-			IP_FRAG_TBL_BUCKET_ENTRIES, max_flow_num, frag_cycles,
+	if ((frag_tbl = rte_ip_frag_table_create(app_config.max_flow_num,
+			IP_FRAG_TBL_BUCKET_ENTRIES, app_config.max_flow_num, frag_cycles,
 			socket)) == NULL) {
 		RTE_LOG(ERR, IP_RSMBL, "ip_frag_tbl_create(%u) on "
 			"lcore: %u for queue: %u failed\n",
-			max_flow_num, lcore, queue);
+			app_config.max_flow_num, lcore, queue);
 		return -1;
 	}
 
@@ -667,7 +686,7 @@ setup_queue_tbl(uint32_t lcore, uint32_t queue)
 	 * Plus, each TX queue can hold up to <max_flow_num> packets.
 	 */
 
-	nb_mbuf = RTE_MAX(max_flow_num, 2UL * MAX_PKT_BURST) * MAX_FRAG_NUM;
+	nb_mbuf = RTE_MAX(app_config.max_flow_num, 2UL * MAX_PKT_BURST) * MAX_FRAG_NUM;
 	nb_mbuf *= (port_conf.rxmode.max_rx_pkt_len + BUF_SIZE - 1) / BUF_SIZE;
 	nb_mbuf *= 2; /* ipv4 and ipv6 */
 	nb_mbuf += 1024;//RTE_TEST_RX_DESC_DEFAULT + RTE_TEST_TX_DESC_DEFAULT;
@@ -744,11 +763,14 @@ main(int argc, char **argv)
 	argc -= ret;
 	argv += ret;
 
-	rte_set_log_level(RTE_LOG_INFO);
+
 	/* parse application arguments (after the EAL ones) */
 	ret = parse_args(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid IP reassembly parameters\n");
+
+	printf("Set log level %d\n", app_config.log_level);
+	rte_set_log_level(app_config.log_level);
 
 	if (setup_ring() < 0)
 		rte_exit(EXIT_FAILURE, "setup_ring failed\n");
