@@ -116,6 +116,13 @@ static struct app_config_t {
 	uint32_t max_flow_ttl;
 	uint32_t tx_pps;
 	uint32_t display_pps;
+	uint32_t dump:1,
+			 stat:1,
+			 gc:1,	/* garbage collection */
+			 reserved:29;
+	uint32_t error;	/* error case, 1: missing last fragment */
+	uint32_t mtu;
+	uint32_t frags;
 	uint32_t log_level;
 	uint64_t count;
 	uint64_t enq_fail;
@@ -127,6 +134,11 @@ static struct app_config_t {
 	.count = 1,
 	.enq_fail = 0,
 	.log_level = RTE_LOG_INFO,
+	.mtu = IPV4_MTU_DEFAULT,
+	.error = 0,
+	.dump = 0,
+	.stat = 0,
+	.gc = 0,
 };
 
 struct mbuf_table {
@@ -137,7 +149,6 @@ struct mbuf_table {
 };
 
 /* reassembly */
-struct rte_ip_frag_tbl *frag_tbl;
 struct rte_mempool *pool;
 struct rte_ring *ring;
 #define RING_NAME		"RING"
@@ -149,20 +160,9 @@ struct rte_mempool *indirect_pool;
 #define INDIR_MP_NAME	"INDIR_MP"
 #define NB_MBUF			8192
 
-struct tx_lcore_stat {
-	uint64_t call;
-	uint64_t drop;
-	uint64_t queue;
-	uint64_t send;
-};
-
-#define MAX_RX_QUEUE_PER_LCORE 16
-#define MAX_TX_QUEUE_PER_PORT 16
-#define MAX_RX_QUEUE_PER_PORT 128
-
 struct lcore_queue_conf {
+	struct rte_ip_frag_tbl *frag_tbl;
 	struct rte_ip_frag_death_row death_row;
-	struct mbuf_table *tx_mbufs[RTE_MAX_ETHPORTS];
 } __rte_cache_aligned;
 static struct lcore_queue_conf lcore_queue_conf[RTE_MAX_LCORE];
 
@@ -216,7 +216,7 @@ reassemble(struct rte_mbuf *m, uint8_t portid, uint32_t queue,
 		if (rte_ipv4_frag_pkt_is_fragmented(ip_hdr)) {
 			struct rte_mbuf *mo;
 
-			tbl = frag_tbl;
+			tbl = qconf->frag_tbl;
 			dr = &qconf->death_row;
 
 			/* prepare mbuf: setup l2_len/l3_len. */
@@ -235,8 +235,8 @@ reassemble(struct rte_mbuf *m, uint8_t portid, uint32_t queue,
 				ip_hdr = rte_pktmbuf_mtod(m, struct ipv4_hdr *);
 			}
 
-			RTE_LOG(DEBUG, IP_RSMBL, "[%d] reassembled. offset %d t_length %u\n", 
-					rte_lcore_id(), 
+			RTE_LOG(INFO, IP_RSMBL, "[%p] reassembled. offset %d t_length %u\n", 
+					m, 
 					ip_hdr->fragment_offset,
 					rte_be_to_cpu_16(ip_hdr->total_length));
 			return m;
@@ -254,7 +254,7 @@ static inline struct rte_mbuf *build_pkt(void)
 	struct ipv4_hdr *ip;
    
 #ifdef FRAG
-	frag_size = IPV4_MTU_DEFAULT + 10;
+	frag_size = 1510;
 #else
 	frag_size = 1480;	/* should be multile of 8 */
 #endif
@@ -286,7 +286,7 @@ static inline struct rte_mbuf *build_pkt(void)
 
 	ip->packet_id = rte_cpu_to_be_16(packet_id);
 
-	RTE_LOG(DEBUG, IP_RSMBL, "%10ju producer, id(N) %5u\n", tx_count, ip->packet_id);
+	RTE_LOG(DEBUG, IP_RSMBL, "%10ju id(N) %5u\n", tx_count, ip->packet_id);
 
 	m->l2_len = 0;
 	m->l3_len = sizeof(struct ipv4_hdr);
@@ -322,7 +322,6 @@ producer(void)
 
 			if (unlikely(m != NULL)) {
 				if (rte_ring_enqueue(ring, m) < 0) {
-					//	RTE_LOG(ERR, IP_RSMBL, "fail to enqueue\n");
 					rte_pktmbuf_free(m);
 					app_config.enq_fail += 1;
 				}
@@ -333,30 +332,76 @@ producer(void)
 	}
 }
 
+static void rte_print_lru(struct rte_ip_frag_tbl *tbl)
+{
+	struct ip_frag_pkt *fp;
+	uint64_t max_cycles;
+	uint64_t cur_tsc;
+	uint32_t expired = 0;
+	struct ip_pkt_list *lru;
+	uint32_t i;
+
+	max_cycles = tbl->max_cycles;
+	cur_tsc = rte_rdtsc();
+
+	lru = &tbl->lru;
+
+	RTE_LOG(INFO, IP_RSMBL, "----------------------------------------\n");
+	RTE_LOG(INFO, IP_RSMBL, "Print LRU list\n");
+	TAILQ_FOREACH(fp, lru, lru) {
+		if ((max_cycles + fp->start) < cur_tsc) {
+			expired = 1;
+		} else {
+			expired = 0;
+		}
+
+		/* Note. Assume that the first fragment is received */
+		RTE_LOG(INFO, IP_RSMBL, "lru %p mbuf[1] %p id(N) %5u last_idx %u Elapsed:%16ju(%s)\n", 
+				fp, fp->frags[1].mb, fp->key.id, fp->last_idx, 
+				cur_tsc - fp->start, expired == 1 ? "expired" : "");
+		for (i = 0 ; i < IP_MAX_FRAG_NUM; i++) {
+			RTE_LOG(INFO, IP_RSMBL, "\t[%u] %p\n", i, fp->frags[i].mb);
+		}
+
+		if (app_config.dump)
+			rte_pktmbuf_dump(stdout, fp->frags[1].mb, 20);
+	}
+	RTE_LOG(INFO, IP_RSMBL, "----------------------------------------\n");
+}
+
+
+inline static void print_mempool_status(void)
+{
+	RTE_LOG(INFO, IP_RSMBL, ">>>>> mbuf count %u %u %u\n", 
+			rte_mempool_count(pool),
+			rte_mempool_count(direct_pool),
+			rte_mempool_count(indirect_pool));
+	RTE_LOG(INFO, IP_RSMBL, ">>>>> free mbuf count %u %u %u\n", 
+			rte_mempool_free_count(pool),
+			rte_mempool_free_count(direct_pool),
+			rte_mempool_free_count(indirect_pool));
+}
+
 #define REPORT_INTERVAL_US	1000000
 static int
 consumer(void)
 {
-	//struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned lcore_id;
 	uint64_t diff_tsc;
 	uint64_t cur_tsc;
 	uint64_t prev_print_tsc;
 	uint64_t prev_tsc;
 
-	int i;
 	struct lcore_queue_conf *qconf;
 	const uint64_t interval_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S
 		* (1000000/app_config.tx_pps);
 	const uint64_t display_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S
 		* (1000000) * app_config.display_pps;
-	uint64_t count = 0;
-	uint64_t reasm_count = 0;
+	uint64_t count = 0;					/* number of packet processed */
+	uint64_t reasm_count = 0;			/* reassembled count */
+
 	uint64_t last_count = 0;
 	uint64_t last_reasm = 0;
-	/*
-	int nb_rx;
-	*/
 
 	prev_tsc = 0;
 	prev_print_tsc = 0;
@@ -394,26 +439,49 @@ consumer(void)
 
 			ip = rte_pktmbuf_mtod(m, struct ipv4_hdr *);
 
-			RTE_LOG(INFO, IP_RSMBL, "%p id(N) %5u, offset %u\n", 
+			RTE_LOG(INFO, IP_RSMBL, "\n\n");
+			RTE_LOG(INFO, IP_RSMBL, "====================================\n");
+			RTE_LOG(INFO, IP_RSMBL, "[%p New mbuf id(N) %5u, offset %u\n", 
 					m, ip->packet_id, ip->fragment_offset);
 #ifdef FRAG
 			{
-				struct rte_mbuf *m_table[2];
+#define NB_FRAGS		4
+				struct rte_mbuf *m_table[NB_FRAGS];
 				int ret;
+				int i;
 
 				ret = rte_ipv4_fragment_packet(m, (struct rte_mbuf **)&m_table, 
-						2, IPV4_MTU_DEFAULT, direct_pool, indirect_pool);
+						NB_FRAGS, app_config.mtu, direct_pool, indirect_pool);
 				rte_pktmbuf_free(m);
+				RTE_LOG(INFO, IP_RSMBL, "%d fragments\n", ret);
 
 				if (ret < 0) {
-					RTE_LOG(DEBUG, IP_RSMBL, "fail to fragment (%d)`\n", ret);
+					RTE_LOG(DEBUG, IP_RSMBL, "fail to fragment (%d)\n", ret);
 					continue;
 				}
 
-				for (i = 0;i < 2; i++) {
-					RTE_LOG(DEBUG, IP_RSMBL, "%u %p\n", i, m_table[i]);
+				/* not good to modify ret */
+				for (i = 0; i < ret-1; i++) {
+					RTE_LOG(INFO, IP_RSMBL, "[%p] fragments : for reassembly\n", 
+							m_table[i]);
 					m = reassemble(m_table[i], 0, 0, qconf, cur_tsc);
 				}
+
+				if (m != NULL) {
+					RTE_LOG(ERR, IP_RSMBL, "[%p] Errorenous reassembly\n", m);
+					rte_panic("Error in reassembly\n");
+				}
+
+				if (app_config.error == 1) {
+					RTE_LOG(INFO, IP_RSMBL, "[%p] fragments : freed\n", 
+							m_table[ret-1]);
+					rte_pktmbuf_free(m_table[ret-1]);
+				} else {
+					RTE_LOG(INFO, IP_RSMBL, "[%p] fragments : for reassembly\n", 
+							m_table[ret-1]);
+					m = reassemble(m_table[ret-1], 0, 0, qconf, cur_tsc);
+				}
+
 				count++;
 			}
 #else
@@ -422,13 +490,14 @@ consumer(void)
 #endif
 
 			if (m == NULL) {
-				if (unlikely((app_config.enq_fail == 0) && (count % 2) == 0)) {
-					RTE_LOG(ERR, IP_RSMBL, "Failed to reassemble\n");
-				}
+				RTE_LOG(ERR, IP_RSMBL, "Failed to reassemble\n");
 			} else {
 				reasm_count++;
+				RTE_LOG(INFO, IP_RSMBL, "Free reassembled mbuf %p\n", m);
 				rte_pktmbuf_free(m);
 			}
+
+			rte_print_lru(qconf->frag_tbl);
 		}
 
 		/* print stats */
@@ -449,13 +518,34 @@ consumer(void)
 					incr_rx * 1500*8/1000/1000,
 					app_config.enq_fail);
 
-			rte_ip_frag_table_statistics_dump(stdout, frag_tbl);
+			print_mempool_status();
+
+			if (app_config.stat)
+				rte_ip_frag_table_statistics_dump(stdout, qconf->frag_tbl);
 
 			last_count = count;
 			last_reasm = reasm_count;
 		}
 
+		if (app_config.gc)
+			ip_frag_free_lru(qconf->frag_tbl, &qconf->death_row, cur_tsc);
+
 		rte_ip_frag_free_death_row(&qconf->death_row, PREFETCH_OFFSET);
+	}
+
+	/* garbage colect repeately */
+	while (rte_mempool_free_count(pool) || 
+			rte_mempool_free_count(direct_pool) || 
+			rte_mempool_free_count(indirect_pool)) {
+
+		rte_delay_ms(10);	
+		cur_tsc = rte_rdtsc();
+
+		ip_frag_free_lru(qconf->frag_tbl, &qconf->death_row, cur_tsc);
+		rte_ip_frag_free_death_row(&qconf->death_row, PREFETCH_OFFSET);
+
+		rte_ip_frag_table_statistics_dump(stdout, qconf->frag_tbl);
+		print_mempool_status();
 	}
 }
 
@@ -490,7 +580,12 @@ print_usage(const char *prgname)
 		"flow\n"
 		"  --tx_pps=<pps>:Tx PPS\n"
 		"  --count=<pps>:number of packet to test "
-		"  --log=<log_level>:1:Emergency, 4:Error, 7:Info, 8:Debug",
+		"  --log=<log_level>:1:Emergency, 4:Error, 7:Info, 8:Debug"
+		"  --mtu=<mtu>:1500 is default value"
+		"  --error=<code>:0 No error, 1 miss last fragment"
+		"  --dump:1:Dump"
+		"  --stat:1:Print Stats"
+		"  --gc:1:Garbage colection",
 		prgname);
 }
 
@@ -557,7 +652,12 @@ parse_args(int argc, char **argv)
 		{"tx_pps", 1, 0, 0},
 		{"count", 1, 0, 0},
 		{"display_pps", 1, 0, 0},
+		{"mtu", 1, 0, 0},
 		{"log", 1, 0, 0},
+		{"error", 1, 0, 0},
+		{"dump", 0, 0, 0},
+		{"stat", 0, 0, 0},
+		{"gc", 0, 0, 0},
 		{NULL, 0, 0, 0}
 	};
 
@@ -598,7 +698,7 @@ parse_args(int argc, char **argv)
 			}
 
 			if (!strncmp(lgopts[option_index].name, "tx_pps", 6)) {
-				app_config.tx_pps = (uint32_t)strtol(optarg, NULL, 0);
+				app_config.tx_pps = strtol(optarg, NULL, 0);
 
 				if (app_config.tx_pps == 0) {
 					printf("invalid pps\n");
@@ -627,6 +727,21 @@ parse_args(int argc, char **argv)
 				}
 			}
 
+			if (!strncmp(lgopts[option_index].name, "error", 5)) {
+				app_config.error = (uint32_t)strtol(optarg, NULL, 0);
+			}
+
+			if (!strncmp(lgopts[option_index].name, "mtu", 3)) {
+				app_config.mtu = (uint32_t)strtol(optarg, NULL, 0);
+
+				if ((app_config.mtu == 0) || (app_config.mtu > IPV4_MTU_DEFAULT)) {
+					printf("invalid MTU\n");
+					print_usage(prgname);
+					return -1;
+				}
+				RTE_LOG(INFO, IP_RSMBL, "MTU : %u\n", app_config.mtu);
+			}
+
 			if (!strncmp(lgopts[option_index].name, "log", 3)) {
 				app_config.log_level = (uint32_t)strtol(optarg, NULL, 0);
 
@@ -636,6 +751,18 @@ parse_args(int argc, char **argv)
 					print_usage(prgname);
 					return -1;
 				}
+			}
+
+			if (!strncmp(lgopts[option_index].name, "dump", 3)) {
+				app_config.dump = 1;
+			}
+
+			if (!strncmp(lgopts[option_index].name, "stat", 3)) {
+				app_config.stat = 1;
+			}
+
+			if (!strncmp(lgopts[option_index].name, "gc", 2)) {
+				app_config.gc = 1;
 			}
 
 			break;
@@ -663,6 +790,9 @@ setup_queue_tbl(uint32_t lcore, uint32_t queue)
 	uint32_t nb_mbuf;
 	uint64_t frag_cycles;
 	char buf[RTE_MEMPOOL_NAMESIZE];
+	struct lcore_queue_conf *qconf;
+
+	qconf = &lcore_queue_conf[lcore];
 
 	socket = rte_lcore_to_socket_id(lcore);
 	if (socket == SOCKET_ID_ANY)
@@ -671,7 +801,7 @@ setup_queue_tbl(uint32_t lcore, uint32_t queue)
 	frag_cycles = (rte_get_tsc_hz() + MS_PER_S - 1) / MS_PER_S *
 		app_config.max_flow_ttl;
 
-	if ((frag_tbl = rte_ip_frag_table_create(app_config.max_flow_num,
+	if ((qconf->frag_tbl = rte_ip_frag_table_create(app_config.max_flow_num,
 			IP_FRAG_TBL_BUCKET_ENTRIES, app_config.max_flow_num, frag_cycles,
 			socket)) == NULL) {
 		RTE_LOG(ERR, IP_RSMBL, "ip_frag_tbl_create(%u) on "
