@@ -536,7 +536,7 @@ consumer(void)
 		}
 
 		if (app_config.gc)
-			ip_frag_free_lru(qconf->frag_tbl, &qconf->death_row, cur_tsc);
+			rte_ip_frag_free_lru(qconf->frag_tbl, &qconf->death_row, cur_tsc);
 
 		rte_ip_frag_free_death_row(&qconf->death_row, PREFETCH_OFFSET);
 	}
@@ -549,12 +549,15 @@ consumer(void)
 		rte_delay_ms(10);	
 		cur_tsc = rte_rdtsc();
 
-		ip_frag_free_lru(qconf->frag_tbl, &qconf->death_row, cur_tsc);
+		rte_ip_frag_free_lru(qconf->frag_tbl, &qconf->death_row, cur_tsc);
 		rte_ip_frag_free_death_row(&qconf->death_row, PREFETCH_OFFSET);
 
 		rte_ip_frag_table_statistics_dump(stdout, qconf->frag_tbl);
 		print_mempool_status();
 	}
+
+	if (app_config.stat)
+		rte_ip_frag_table_statistics_dump(stdout, qconf->frag_tbl);
 }
 
 

@@ -56,12 +56,12 @@ rte_ip_frag_free_death_row(struct rte_ip_frag_death_row *dr,
 
 	for (i = 0; i != n - k; i++) {
 		rte_prefetch0(dr->row[i + k]);
-		RTE_LOG(ERR, USER1, "%s: free mbuf %p\n", __func__, dr->row[i]);
+		RTE_LOG(INFO, USER1, "\t%s: free mbuf %p\n", __func__, dr->row[i]);
 		rte_pktmbuf_free(dr->row[i]);
 	}
 
 	for (; i != n; i++) {
-		RTE_LOG(ERR, USER1, "%s: free mbuf %p\n", __func__, dr->row[i]);
+		RTE_LOG(INFO, USER1, "\t%s: free mbuf %p\n", __func__, dr->row[i]);
 		rte_pktmbuf_free(dr->row[i]);
 	}
 
@@ -130,7 +130,8 @@ rte_ip_frag_table_statistics_dump(FILE *f, const struct rte_ip_frag_tbl *tbl)
 		"entries reused by timeout    :\t%" PRIu64 ";\n"
 		"total add failures           :\t%" PRIu64 ";\n"
 		"add no-space failures        :\t%" PRIu64 ";\n"
-		"add hash-collisions failures :\t%" PRIu64 ";\n",
+		"add hash-collisions failures :\t%" PRIu64 ";\n"
+		"mbuf in tbl                  :\t%" PRIu64 ";\n",
 		tbl->max_entries,
 		tbl->use_entries,
 		tbl->stat.find_num,
@@ -139,5 +140,6 @@ rte_ip_frag_table_statistics_dump(FILE *f, const struct rte_ip_frag_tbl *tbl)
 		tbl->stat.reuse_num,
 		fail_total,
 		fail_nospace,
-		fail_total - fail_nospace);
+		fail_total - fail_nospace,
+		tbl->stat.mbuf_num);
 }

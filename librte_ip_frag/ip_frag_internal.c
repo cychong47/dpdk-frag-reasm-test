@@ -143,22 +143,20 @@ ipv6_frag_hash(const struct ip_frag_key *key, uint32_t *v1, uint32_t *v2)
  * @param dr
  * @param tms
  */
-inline void 
-ip_frag_free_lru(struct rte_ip_frag_tbl *tbl, struct rte_ip_frag_death_row *dr, uint64_t tms)
+void 
+rte_ip_frag_free_lru(struct rte_ip_frag_tbl *tbl, struct rte_ip_frag_death_row *dr, uint64_t tms)
 {
 	struct ip_frag_pkt *lru;
 	uint64_t max_cycles;
 
 	lru = TAILQ_FIRST(&tbl->lru);
 	if (lru == NULL) {
-		IP_FRAG_LOG(DEBUG, "%s:%d lru is NULL\n", __func__, __LINE__);
 		return;
 	}
 
 	max_cycles = tbl->max_cycles;
 
 	if (dr == NULL) {
-		IP_FRAG_LOG(INFO, "%s:%d dr is NULL\n", __func__, __LINE__);
 		return;
 	}
 
@@ -362,6 +360,9 @@ ip_frag_find(struct rte_ip_frag_tbl *tbl, struct rte_ip_frag_death_row *dr,
 	}
 
 	IP_FRAG_TBL_STAT_UPDATE(&tbl->stat, fail_total, (pkt == NULL));
+
+	/* now mbuf is in frag_tbl */
+	IP_FRAG_TBL_STAT_UPDATE(&tbl->stat, mbuf_num, (pkt != NULL));
 
 	tbl->last = pkt;
 	return pkt;

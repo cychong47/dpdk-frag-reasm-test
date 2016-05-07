@@ -110,6 +110,7 @@ struct ip_frag_tbl_stat {
 	uint64_t reuse_num;     /**< # of reuse (del/add) ops. */
 	uint64_t fail_total;    /**< total # of add failures. */
 	uint64_t fail_nospace;  /**< # of 'no space' add failures. */
+	uint64_t mbuf_num;		/**< # of mbufs in tbl */
 } __rte_cache_aligned;
 
 /** fragmentation table */
@@ -339,7 +340,6 @@ rte_ipv4_frag_pkt_is_fragmented(const struct ipv4_hdr * hdr) {
 void rte_ip_frag_free_death_row(struct rte_ip_frag_death_row *dr,
 		uint32_t prefetch);
 
-
 /*
  * Dump fragmentation table statistics to file.
  *
@@ -359,8 +359,8 @@ rte_ip_frag_table_statistics_dump(FILE * f, const struct rte_ip_frag_tbl *tbl);
  * @param dr
  * @param tms
  */
-inline void 
-ip_frag_free_lru(struct rte_ip_frag_tbl *tbl, struct rte_ip_frag_death_row *dr, uint64_t tms);
+void 
+rte_ip_frag_free_lru(struct rte_ip_frag_tbl *tbl, struct rte_ip_frag_death_row *dr, uint64_t tms);
 
 #ifdef __cplusplus
 }
