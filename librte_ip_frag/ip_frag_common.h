@@ -75,7 +75,7 @@ struct ip_frag_pkt * ip_frag_lookup(struct rte_ip_frag_tbl *tbl,
 	const struct ip_frag_key *key, uint64_t tms,
 	struct ip_frag_pkt **free, struct ip_frag_pkt **stale);
 
-void ip_frag_check_lru(struct rte_ip_frag_tbl *tbl,
+void ip_frag_tbl_check_lru(struct rte_ip_frag_tbl *tbl,
 		struct rte_ip_frag_death_row *dr,
 		uint64_t tms);
 

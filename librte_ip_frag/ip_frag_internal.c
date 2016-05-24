@@ -137,8 +137,8 @@ ipv6_frag_hash(const struct ip_frag_key *key, uint32_t *v1, uint32_t *v2)
 }
 
 void 
-ip_frag_check_lru(struct rte_ip_frag_tbl *tbl, struct rte_ip_frag_death_row *dr, 
-		uint64_t tms)
+ip_frag_tbl_check_lru(struct rte_ip_frag_tbl *tbl, 
+		struct rte_ip_frag_death_row *dr, uint64_t tms)
 {
 	struct ip_frag_pkt *lru;
 	uint64_t max_cycles;
