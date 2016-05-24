@@ -353,14 +353,15 @@ rte_ip_frag_table_statistics_dump(FILE * f, const struct rte_ip_frag_tbl *tbl);
 
 
 /**
- * Move the last LRU entry to death row
+ * Check the LRU entry and move to death row if expired
  *
  * @param tbl
  * @param dr
  * @param tms
  */
 void 
-rte_ip_frag_free_lru(struct rte_ip_frag_tbl *tbl, struct rte_ip_frag_death_row *dr, uint64_t tms);
+rte_ip_frag_check_lru(struct rte_ip_frag_tbl *tbl, 
+		struct rte_ip_frag_death_row *dr, uint64_t tms);
 
 #ifdef __cplusplus
 }

@@ -143,3 +143,11 @@ rte_ip_frag_table_statistics_dump(FILE *f, const struct rte_ip_frag_tbl *tbl)
 		fail_total - fail_nospace,
 		tbl->stat.mbuf_num);
 }
+
+/* check LRU entry and move to death row if expired */
+void
+rte_ip_frag_check_lru(struct rte_ip_frag_tbl *tbl,  
+		struct rte_ip_frag_death_row *dr, uint64_t tms)
+{
+	ip_frag_check_lru(tbl, dr, tms);
+}
