@@ -136,13 +136,6 @@ ipv6_frag_hash(const struct ip_frag_key *key, uint32_t *v1, uint32_t *v2)
 	*v2 = (v << 7) + (v >> 14);
 }
 
-/**
- * Move the last LRU entry to death row
- *
- * @param tbl
- * @param dr
- * @param tms
- */
 void 
 ip_frag_check_lru(struct rte_ip_frag_tbl *tbl, struct rte_ip_frag_death_row *dr, 
 		uint64_t tms)
